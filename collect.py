@@ -25,6 +25,7 @@ import logging
 import os
 import signal
 import sys
+from collections import deque
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -46,6 +47,26 @@ load_dotenv()
 
 log = logging.getLogger(__name__)
 console = Console()
+
+
+# ── Log buffer ────────────────────────────────────────────────────────────────
+
+_MAX_LOG_LINES = 8
+
+_log_buffer: deque[logging.LogRecord] = deque(maxlen=_MAX_LOG_LINES)
+
+_LEVEL_STYLE: dict[int, str] = {
+    logging.WARNING: "yellow",
+    logging.ERROR: "bold red",
+    logging.CRITICAL: "bold white on red",
+}
+
+
+class _BufferHandler(logging.Handler):
+    """Captures WARNING+ records into the dashboard log buffer."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        _log_buffer.append(record)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -100,8 +121,31 @@ def _make_dashboard() -> Layout:
     db_table.add_row("pm_markets", f"{counts.get('markets', '?'):,}  ({counts.get('resolved', '?')} resolved)")
     db_table.add_row("pm_snapshots", f"{counts.get('snapshots', '?'):,}")
 
+    # ── Alerts panel ──
+    alerts = Text()
+    if _log_buffer:
+        for record in _log_buffer:
+            style = _LEVEL_STYLE.get(record.levelno, "white")
+            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+            alerts.append(f"{ts} ", style="dim")
+            alerts.append(f"{record.levelname:<8}", style=style)
+            alerts.append(f" {record.name}: {record.getMessage()}\n", style=style)
+    else:
+        alerts.append("No warnings or errors.", style="dim")
+
+    alerts_panel_style = "red" if any(r.levelno >= logging.ERROR for r in _log_buffer) else \
+                         "yellow" if _log_buffer else "green"
+
     layout = Layout()
-    layout.split_row(
+    layout.split_column(
+        Layout(name="top", ratio=3),
+        Layout(
+            Panel(alerts, title="Warnings / Errors", border_style=alerts_panel_style),
+            name="alerts",
+            ratio=1,
+        ),
+    )
+    layout["top"].split_row(
         Layout(Panel(oracle, title="Oracle Feed"), name="oracle"),
         Layout(Panel(db_table, title=f"DuckDB  —  {now}"), name="db"),
     )
@@ -171,6 +215,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+
+    buf = _BufferHandler(level=logging.WARNING)
+    buf.setFormatter(logging.Formatter())
+    logging.getLogger().addHandler(buf)
 
     asyncio.run(run_all(dashboard=not args.no_dashboard))
 

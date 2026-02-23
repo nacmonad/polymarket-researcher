@@ -38,11 +38,14 @@ class OutcomeRecorder:
     ) -> dict | None:
         try:
             resp = await client.get(
-                f"{GAMMA_API}/markets/{condition_id}",
+                f"{GAMMA_API}/markets",
+                params={"conditionId": condition_id},
                 timeout=10,
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            markets = data if isinstance(data, list) else data.get("data", [])
+            return markets[0] if markets else None
         except Exception as e:
             log.warning("Outcome fetch failed for %s: %s", condition_id[:12], e)
             return None
