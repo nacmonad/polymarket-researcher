@@ -124,96 +124,185 @@ CREATE TABLE IF NOT EXISTS pm_trades (
 --
 -- pm_markets stores Up token as token_yes_id, Down token as token_no_id.
 -- Outcomes are 'UP' or 'DOWN' (from Gamma API resolved outcome field, uppercased).
--- P&L: if signal direction == outcome direction we bought the winning side.
---   up_pnl  = P&L for buying the Up  token at up_ask_at_signal
---   down_pnl = P&L for buying the Down token at down_ask_at_signal
+--
+-- Snapshot join strategy:
+--   Primary  – ASOF JOIN finds the latest snapshot at or before the signal time
+--              (efficient O(log n) per row, no correlated subqueries).
+--   Fallback – if no prior snapshot exists (cold-start / backfilled markets),
+--              use the earliest snapshot within +60s of signal time.
+--   snap_lag_secs: seconds between snapshot and signal (negative = snapshot came
+--                  after signal, i.e. cold-start fallback was used). NULL = no
+--                  snapshot found at all for that market.
 
 CREATE OR REPLACE VIEW signal_outcomes AS
+WITH
+-- ASOF JOIN: latest snapshot at or before signal time, per (condition_id, token_id)
+-- We pre-join with pm_markets to get token IDs, then ASOF join snapshots.
+base AS (
+    -- One row per signal × nearest-resolving market (prevents cartesian explosion).
+    -- We want the single market whose close_time is closest to (and after) the signal,
+    -- within a 30-minute look-ahead window.  Using DISTINCT ON ordered by close_time ASC
+    -- picks the minimum close_time per signal.
+    SELECT DISTINCT ON (se.id)
+        se.id,
+        se.ts,
+        se.event_type,
+        se.symbol,
+        se.direction,
+        se.deviation_pct,
+        se.market_price,
+        se.chainlink_price,
+        se.chainlink_age_secs,
+        se.round_duration_secs,
+        se.bb_width_pct,
+        se.rsi_14,
+        se.momentum_10,
+        pm.condition_id,
+        pm.timeframe,
+        pm.close_time,
+        pm.outcome,
+        pm.winning_price,
+        pm.token_yes_id,
+        pm.token_no_id,
+        DATEDIFF('second', se.ts, pm.close_time) AS secs_to_resolution
+    FROM signal_events se
+    LEFT JOIN pm_markets pm
+        ON pm.asset = SPLIT_PART(se.symbol, '/', 1)
+        AND pm.close_time > se.ts
+        AND pm.close_time <= se.ts + INTERVAL '30 minutes'
+    WHERE se.event_type NOT IN ('exchange_status')
+      AND (
+          se.round_duration_secs IS NOT NULL
+          OR se.event_type IN ('pre_trigger_alert', 'bb_breakout', 'deviation_approach')
+      )
+    ORDER BY se.id, pm.close_time ASC
+),
+-- Nearest snapshot before or at signal (ASOF semantics via correlated max)
+snap_pre AS (
+    SELECT DISTINCT ON (b.id, b.token_yes_id)
+        b.id        AS signal_id,
+        'up'        AS side,
+        s.ts        AS snap_ts,
+        s.best_ask,
+        s.best_bid,
+        s.spread,
+        s.bid_depth_1,
+        s.ask_depth_1
+    FROM base b
+    JOIN pm_snapshots s
+        ON s.condition_id = b.condition_id
+        AND s.token_id    = b.token_yes_id
+        AND s.ts         <= b.ts
+    ORDER BY b.id, b.token_yes_id, s.ts DESC
+),
+snap_pre_dn AS (
+    SELECT DISTINCT ON (b.id, b.token_no_id)
+        b.id        AS signal_id,
+        s.ts        AS snap_ts,
+        s.best_ask,
+        s.best_bid
+    FROM base b
+    JOIN pm_snapshots s
+        ON s.condition_id = b.condition_id
+        AND s.token_id    = b.token_no_id
+        AND s.ts         <= b.ts
+    ORDER BY b.id, b.token_no_id, s.ts DESC
+),
+-- Cold-start fallback: earliest snapshot within +60s if no prior snap exists
+snap_post AS (
+    SELECT DISTINCT ON (b.id, b.token_yes_id)
+        b.id        AS signal_id,
+        'up'        AS side,
+        s.ts        AS snap_ts,
+        s.best_ask,
+        s.best_bid,
+        s.spread,
+        s.bid_depth_1,
+        s.ask_depth_1
+    FROM base b
+    LEFT JOIN snap_pre sp ON sp.signal_id = b.id
+    JOIN pm_snapshots s
+        ON s.condition_id = b.condition_id
+        AND s.token_id    = b.token_yes_id
+        AND s.ts BETWEEN b.ts AND b.ts + INTERVAL '60 seconds'
+    WHERE sp.signal_id IS NULL
+    ORDER BY b.id, b.token_yes_id, s.ts ASC
+),
+snap_post_dn AS (
+    SELECT DISTINCT ON (b.id, b.token_no_id)
+        b.id        AS signal_id,
+        s.ts        AS snap_ts,
+        s.best_ask,
+        s.best_bid
+    FROM base b
+    LEFT JOIN snap_pre_dn spd ON spd.signal_id = b.id
+    JOIN pm_snapshots s
+        ON s.condition_id = b.condition_id
+        AND s.token_id    = b.token_no_id
+        AND s.ts BETWEEN b.ts AND b.ts + INTERVAL '60 seconds'
+    WHERE spd.signal_id IS NULL
+    ORDER BY b.id, b.token_no_id, s.ts ASC
+),
+-- Merge primary + fallback
+snap_up AS (
+    SELECT * FROM snap_pre
+    UNION ALL
+    SELECT * FROM snap_post
+),
+snap_dn AS (
+    SELECT * FROM snap_pre_dn
+    UNION ALL
+    SELECT * FROM snap_post_dn
+)
 SELECT
-    se.id,
-    se.ts,
-    se.event_type,
-    se.symbol,
-    se.direction,
-    se.deviation_pct,
-    se.market_price,
-    se.chainlink_price,
-    se.chainlink_age_secs,
-    se.round_duration_secs,
-    se.bb_width_pct,
-    se.rsi_14,
-    se.momentum_10,
-    pm.condition_id,
-    pm.timeframe,
-    pm.close_time,
-    pm.outcome,
-    pm.winning_price,
-    DATEDIFF('second', se.ts, pm.close_time)  AS secs_to_resolution,
-    -- Up token (token_yes_id) snapshot nearest to signal time
-    snap_up.best_ask                          AS up_ask_at_signal,
-    snap_up.best_bid                          AS up_bid_at_signal,
-    snap_up.spread                            AS spread_at_signal,
-    snap_up.bid_depth_1                       AS up_bid_depth,
-    snap_up.ask_depth_1                       AS up_ask_depth,
-    -- Down token (token_no_id) snapshot nearest to signal time
-    snap_dn.best_ask                          AS down_ask_at_signal,
-    snap_dn.best_bid                          AS down_bid_at_signal,
+    b.id,
+    b.ts,
+    b.event_type,
+    b.symbol,
+    b.direction,
+    b.deviation_pct,
+    b.market_price,
+    b.chainlink_price,
+    b.chainlink_age_secs,
+    b.round_duration_secs,
+    b.bb_width_pct,
+    b.rsi_14,
+    b.momentum_10,
+    b.condition_id,
+    b.timeframe,
+    b.close_time,
+    b.outcome,
+    b.winning_price,
+    b.secs_to_resolution,
+    -- Up token snapshot
+    su.best_ask                                   AS up_ask_at_signal,
+    su.best_bid                                   AS up_bid_at_signal,
+    su.spread                                     AS spread_at_signal,
+    su.bid_depth_1                                AS up_bid_depth,
+    su.ask_depth_1                                AS up_ask_depth,
+    -- Down token snapshot
+    sd.best_ask                                   AS down_ask_at_signal,
+    sd.best_bid                                   AS down_bid_at_signal,
+    -- Snapshot freshness (negative = cold-start fallback used)
+    DATEDIFF('second', su.snap_ts, b.ts)          AS snap_lag_secs,
     -- P&L if you bought Up at signal time
-    CASE WHEN pm.outcome = 'UP'   THEN 1.0 - snap_up.best_ask
-         WHEN pm.outcome = 'DOWN' THEN -snap_up.best_ask
+    CASE WHEN b.outcome = 'UP'   THEN 1.0 - su.best_ask
+         WHEN b.outcome = 'DOWN' THEN       -su.best_ask
          ELSE NULL
-    END                                       AS up_pnl,
+    END                                           AS up_pnl,
     -- P&L if you bought Down at signal time
-    CASE WHEN pm.outcome = 'DOWN' THEN 1.0 - snap_dn.best_ask
-         WHEN pm.outcome = 'UP'   THEN -snap_dn.best_ask
+    CASE WHEN b.outcome = 'DOWN' THEN 1.0 - sd.best_ask
+         WHEN b.outcome = 'UP'   THEN       -sd.best_ask
          ELSE NULL
-    END                                       AS down_pnl,
-    -- P&L for the side aligned with the signal direction
+    END                                           AS down_pnl,
+    -- P&L for the side aligned with signal direction
     CASE
-        WHEN se.direction = 'UP'   AND pm.outcome = 'UP'   THEN 1.0 - snap_up.best_ask
-        WHEN se.direction = 'UP'   AND pm.outcome = 'DOWN' THEN -snap_up.best_ask
-        WHEN se.direction = 'DOWN' AND pm.outcome = 'DOWN' THEN 1.0 - snap_dn.best_ask
-        WHEN se.direction = 'DOWN' AND pm.outcome = 'UP'   THEN -snap_dn.best_ask
+        WHEN b.direction = 'UP'   AND b.outcome = 'UP'   THEN 1.0 - su.best_ask
+        WHEN b.direction = 'UP'   AND b.outcome = 'DOWN' THEN       -su.best_ask
+        WHEN b.direction = 'DOWN' AND b.outcome = 'DOWN' THEN 1.0 - sd.best_ask
+        WHEN b.direction = 'DOWN' AND b.outcome = 'UP'   THEN       -sd.best_ask
         ELSE NULL
-    END                                       AS directional_pnl,
-    -- nearest oracle tick at signal time for context
-    ot.market_price                           AS tick_price_at_signal
-FROM signal_events se
--- PM market resolving within 30 minutes of signal
-LEFT JOIN pm_markets pm
-    ON pm.asset = SPLIT_PART(se.symbol, '/', 1)
-    AND pm.close_time BETWEEN se.ts AND se.ts + INTERVAL '30 minutes'
--- Up token snapshot at signal time
-LEFT JOIN pm_snapshots snap_up
-    ON snap_up.condition_id = pm.condition_id
-    AND snap_up.token_id = pm.token_yes_id
-    AND snap_up.ts = (
-        SELECT MAX(ts) FROM pm_snapshots s2
-        WHERE s2.condition_id = pm.condition_id
-          AND s2.ts <= se.ts
-          AND s2.token_id = pm.token_yes_id
-    )
--- Down token snapshot at signal time
-LEFT JOIN pm_snapshots snap_dn
-    ON snap_dn.condition_id = pm.condition_id
-    AND snap_dn.token_id = pm.token_no_id
-    AND snap_dn.ts = (
-        SELECT MAX(ts) FROM pm_snapshots s2
-        WHERE s2.condition_id = pm.condition_id
-          AND s2.ts <= se.ts
-          AND s2.token_id = pm.token_no_id
-    )
--- nearest oracle tick
-LEFT JOIN oracle_ticks ot
-    ON ot.symbol = se.symbol
-    AND ot.ts = (
-        SELECT ts FROM oracle_ticks o2
-        WHERE o2.symbol = se.symbol AND o2.ts >= se.ts
-        ORDER BY ts LIMIT 1
-    )
--- only actionable signals
-WHERE se.event_type NOT IN ('exchange_status')
-  AND (
-    se.round_duration_secs IS NOT NULL
-    OR se.event_type IN ('pre_trigger_alert', 'bb_breakout', 'deviation_approach')
-  );
+    END                                           AS directional_pnl
+FROM base b
+LEFT JOIN snap_up su ON su.signal_id = b.id
+LEFT JOIN snap_dn sd ON sd.signal_id = b.id;
