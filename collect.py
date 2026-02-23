@@ -51,22 +51,26 @@ console = Console()
 
 # ── Log buffer ────────────────────────────────────────────────────────────────
 
-_MAX_LOG_LINES = 8
+_MAX_LOG_LINES = 10
 
-_log_buffer: deque[logging.LogRecord] = deque(maxlen=_MAX_LOG_LINES)
+_info_buffer:  deque[logging.LogRecord] = deque(maxlen=_MAX_LOG_LINES)
+_alert_buffer: deque[logging.LogRecord] = deque(maxlen=_MAX_LOG_LINES)
 
 _LEVEL_STYLE: dict[int, str] = {
-    logging.WARNING: "yellow",
-    logging.ERROR: "bold red",
+    logging.WARNING:  "yellow",
+    logging.ERROR:    "bold red",
     logging.CRITICAL: "bold white on red",
 }
 
 
 class _BufferHandler(logging.Handler):
-    """Captures WARNING+ records into the dashboard log buffer."""
+    """Routes INFO records to _info_buffer, WARNING+ to _alert_buffer."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        _log_buffer.append(record)
+        if record.levelno >= logging.WARNING:
+            _alert_buffer.append(record)
+        elif record.levelno == logging.INFO:
+            _info_buffer.append(record)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -121,33 +125,45 @@ def _make_dashboard() -> Layout:
     db_table.add_row("pm_markets", f"{counts.get('markets', '?'):,}  ({counts.get('resolved', '?')} resolved)")
     db_table.add_row("pm_snapshots", f"{counts.get('snapshots', '?'):,}")
 
-    # ── Alerts panel ──
-    alerts = Text()
-    if _log_buffer:
-        for record in _log_buffer:
-            style = _LEVEL_STYLE.get(record.levelno, "white")
-            ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
-            alerts.append(f"{ts} ", style="dim")
-            alerts.append(f"{record.levelname:<8}", style=style)
-            alerts.append(f" {record.name}: {record.getMessage()}\n", style=style)
-    else:
-        alerts.append("No warnings or errors.", style="dim")
+    # ── Info panel ──
+    def _render_log_panel(
+        buf: deque[logging.LogRecord],
+        empty_msg: str,
+        default_style: str = "cyan",
+    ) -> Text:
+        t = Text()
+        if buf:
+            for record in buf:
+                style = _LEVEL_STYLE.get(record.levelno, default_style)
+                ts = datetime.fromtimestamp(record.created, tz=timezone.utc).strftime("%H:%M:%S")
+                t.append(f"{ts} ", style="dim")
+                t.append(f"{record.name.split('.')[-1]}: ", style="dim")
+                t.append(f"{record.getMessage()}\n", style=style)
+        else:
+            t.append(empty_msg, style="dim")
+        return t
 
-    alerts_panel_style = "red" if any(r.levelno >= logging.ERROR for r in _log_buffer) else \
-                         "yellow" if _log_buffer else "green"
+    info_text   = _render_log_panel(_info_buffer,  "No info logs yet.")
+    alerts_text = _render_log_panel(_alert_buffer, "No warnings or errors.")
+
+    alerts_border = (
+        "red"    if any(r.levelno >= logging.ERROR   for r in _alert_buffer) else
+        "yellow" if _alert_buffer else
+        "green"
+    )
 
     layout = Layout()
     layout.split_column(
-        Layout(name="top", ratio=3),
-        Layout(
-            Panel(alerts, title="Warnings / Errors", border_style=alerts_panel_style),
-            name="alerts",
-            ratio=1,
-        ),
+        Layout(name="top",    ratio=3),
+        Layout(name="bottom", ratio=2),
     )
     layout["top"].split_row(
-        Layout(Panel(oracle, title="Oracle Feed"), name="oracle"),
-        Layout(Panel(db_table, title=f"DuckDB  —  {now}"), name="db"),
+        Layout(Panel(oracle,   title="Oracle Feed"),         name="oracle"),
+        Layout(Panel(db_table, title=f"DuckDB  —  {now}"),  name="db"),
+    )
+    layout["bottom"].split_column(
+        Layout(Panel(info_text,   title="Info",              border_style="blue"),        name="info"),
+        Layout(Panel(alerts_text, title="Warnings / Errors", border_style=alerts_border), name="alerts"),
     )
     return layout
 
@@ -216,9 +232,11 @@ def main() -> None:
         stream=sys.stderr,
     )
 
-    buf = _BufferHandler(level=logging.WARNING)
+    buf = _BufferHandler(level=logging.INFO)
     buf.setFormatter(logging.Formatter())
     logging.getLogger().addHandler(buf)
+    # httpx logs every HTTP request at INFO — too noisy for the dashboard panel
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     asyncio.run(run_all(dashboard=not args.no_dashboard))
 

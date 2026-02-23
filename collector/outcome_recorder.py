@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import httpx
 from dotenv import load_dotenv
 
+from collector.pm_market_discovery import _ASSET_SLUG_PREFIX, _TF_SECONDS
 from db.connection import get_db, write_lock
 
 load_dotenv()
@@ -29,25 +30,51 @@ GAMMA_API = os.getenv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com"
 POLL_INTERVAL = 30  # seconds
 
 
+def _build_slug(asset: str, timeframe: str, close_time: datetime) -> str | None:
+    """Derive the Polymarket slug from close_time + asset + timeframe.
+
+    Slug format: {prefix}-{timeframe}-{window_start_unix}
+    window_start = close_time - timeframe_seconds
+    """
+    prefix = _ASSET_SLUG_PREFIX.get(asset.upper())
+    tf_secs = _TF_SECONDS.get(timeframe)
+    if not prefix or not tf_secs:
+        return None
+    window_start = int(close_time.timestamp()) - tf_secs
+    return f"{prefix}-{timeframe}-{window_start}"
+
+
 class OutcomeRecorder:
     def __init__(self):
         self._running = False
 
     async def _fetch_resolution(
-        self, client: httpx.AsyncClient, condition_id: str
+        self, client: httpx.AsyncClient, slug: str, cid: str
     ) -> dict | None:
+        """Fetch market by slug (the only reliable Gamma API lookup)."""
         try:
             resp = await client.get(
                 f"{GAMMA_API}/markets",
-                params={"conditionId": condition_id},
+                params={"slug": slug, "limit": 1},
                 timeout=10,
             )
             resp.raise_for_status()
             data = resp.json()
             markets = data if isinstance(data, list) else data.get("data", [])
-            return markets[0] if markets else None
+            if not markets:
+                return None
+            market = markets[0]
+            # Verify the slug actually matched our market (sanity check)
+            api_cid = market.get("conditionId") or market.get("condition_id") or ""
+            if api_cid.lower() != cid.lower():
+                log.debug(
+                    "Slug %s returned unexpected CID %s (expected %s) — skipping",
+                    slug, api_cid[:12], cid[:12],
+                )
+                return None
+            return market
         except Exception as e:
-            log.warning("Outcome fetch failed for %s: %s", condition_id[:12], e)
+            log.warning("Outcome fetch failed for slug %s: %s", slug, e)
             return None
 
     def _parse_outcome(self, data: dict) -> tuple[str | None, float | None]:
@@ -73,9 +100,13 @@ class OutcomeRecorder:
                 raw_prices = json.loads(raw_prices)
             except Exception:
                 raw_prices = []
+
+        # Gamma API sometimes uses 0.999... or similar before absolute finality
+        # but for Up/Down markets it should be 1.0. We'll use 0.99 threshold.
         for name, price in zip(raw_outcomes, raw_prices):
             try:
-                if float(price) == 1.0:
+                p = float(price)
+                if p >= 0.99:
                     outcome = name.upper()
                     break
             except (TypeError, ValueError):
@@ -110,11 +141,13 @@ class OutcomeRecorder:
         try:
             pending = db.execute(
                 """
-                SELECT condition_id FROM pm_markets
+                SELECT condition_id, asset, timeframe, close_time FROM pm_markets
                 WHERE resolved_at IS NULL
                   AND close_time < ?
                   AND close_time IS NOT NULL
-                ORDER BY close_time
+                  AND asset IS NOT NULL
+                  AND timeframe IS NOT NULL
+                ORDER BY close_time DESC
                 LIMIT 50
                 """,
                 [now],
@@ -124,8 +157,13 @@ class OutcomeRecorder:
             return 0
 
         resolved = 0
-        for (cid,) in pending:
-            data = await self._fetch_resolution(client, cid)
+        for (cid, asset, timeframe, close_time) in pending:
+            slug = _build_slug(asset, timeframe, close_time)
+            if not slug:
+                log.debug("Can't build slug for %s (%s/%s) — skipping", cid[:12], asset, timeframe)
+                continue
+
+            data = await self._fetch_resolution(client, slug, cid)
             if not data:
                 continue
 
@@ -133,7 +171,6 @@ class OutcomeRecorder:
             if not outcome:
                 continue
 
-            resolved_at = now
             with write_lock:
                 try:
                     db.execute(
@@ -143,7 +180,7 @@ class OutcomeRecorder:
                             resolved_at = ?, last_updated = ?
                         WHERE condition_id = ?
                         """,
-                        [outcome, winning_price, resolved_at, now, cid],
+                        [outcome, winning_price, now, now, cid],
                     )
                     resolved += 1
                     log.info(
