@@ -1,4 +1,4 @@
-VENV := /Users/pointcoexpedro/Dev/.venv
+VENV := /home/nacmonad/.openclaw/workspace/.venv
 PYTHON := $(VENV)/bin/python
 UV := uv
 

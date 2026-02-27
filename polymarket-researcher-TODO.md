@@ -285,6 +285,321 @@ SIGNAL_BUFFER_SECS=300            # seconds of signal context to keep in memory
 
 ---
 
+## PHASE 3.5 — Collection Optimizations & Historical Backfill
+
+### Performance Insights (2026-02-24 Benchmark Results)
+
+**Key Finding**: polymarket-cli historical data provides 1-minute granularity via
+`clob price-history --interval 1m`, which is finer than our live collection
+(currently 500ms oracle ticks, but Polymarket snapshots may be rate-limited).
+
+### Optimization Strategy: Sub-Second Sampling + Periodic Backfill
+
+**Current State**:
+- `btc-oracle-proxy`: Queries every **500ms** (2 samples/minute)
+- `pm_clob_consumer`: Snapshots order book every **500ms** (aligned with oracle)
+- polymarket-cli historical: Returns **1-minute** granularity (60 samples/hour)
+
+**Problem**: Risk of 429 rate limits if we increase snapshot frequency beyond 500ms.
+
+**Proposed Solution**:
+
+1. **Increase live sampling frequency** (avoid 429s):
+   - Query at **250ms, 500ms, and 750ms** intervals (4 samples/minute)
+   - This gives 4x more granular data than CLI historical (1 sample/minute)
+   - Stagger requests to distribute load across the second
+   
+2. **Periodic historical backfill** (gap filling):
+   - Run `polymarket clob price-history --interval 1m` daily (e.g., 3:00 AM UTC)
+   - Backfill any gaps in `pm_snapshots` from last 24h
+   - Use CLI data as ground truth for validation
+   - Detect and log discrepancies between live vs historical data
+   
+3. **Hybrid approach for backtesting**:
+   - **Live data** (250/500/750ms): Used for real-time strategy execution
+   - **Historical data** (1m via CLI): Used for gap-free backtesting over weeks/months
+   - Merge both sources in `signal_outcomes` view with conflict resolution
+
+### Implementation Tasks
+
+- [ ] `collector/pm_clob_consumer.py` — Add configurable snapshot intervals
+  - New env var: `PM_SNAPSHOT_INTERVALS=250,500,750` (milliseconds, comma-separated)
+  - Stagger requests to avoid rate limits (e.g., offset by 83ms each)
+  - Monitor 429 responses, implement exponential backoff per interval
+  - [ ] Add rate limit metrics to dashboard (429 count, backoff state)
+
+- [ ] `collector/historical_backfill.py` — CLI-based gap filler
+  - Query `pm_markets` for active markets from last 24h
+  - For each market, fetch 1m history via `polymarket clob price-history`
+  - Upsert into `pm_snapshots` (merge with live data, preserve higher-resolution samples)
+  - Conflict resolution: If live data exists at same timestamp, keep live data (it's more granular)
+  - Log backfilled rows, gap coverage %
+  - [ ] Run as cron job or integrated into collector (e.g., every 6 hours)
+
+- [ ] `scripts/data_quality.py` — Add historical vs live comparison
+  - Compare live snapshots against CLI historical for same time windows
+  - Flag discrepancies > 1% price deviation
+  - Calculate completeness: `(live_samples + backfilled) / expected_samples`
+  - Target: ≥99% coverage after backfill
+
+- [ ] `db/schema.sql` — Add `pm_snapshots.source` column
+  - Track data source: `'live'` (from CLOB WS) vs `'backfill'` (from CLI history)
+  - Allows filtering/validation queries
+  - Add index: `CREATE INDEX idx_pm_snapshots_source ON pm_snapshots (source, ts);`
+
+### Benefits
+
+1. **Higher resolution live data**: 4 samples/minute (vs 2 currently) without hitting rate limits
+2. **Gap-free historical coverage**: CLI backfill ensures no missed windows
+3. **Validation**: Compare live vs historical to detect collection issues
+4. **Reduced dependency on live collector**: Historical CLI data can bootstrap backtests
+5. **Flexibility**: Can switch to CLI-only if live collection proves unreliable
+
+### Performance Comparison (Latency Benchmarks)
+
+From `perf-tests` results:
+- **Python httpx live**: 19.96ms mean latency (winner for real-time)
+- **polymarket-cli subprocess**: 142.66ms (7x slower, but acceptable for batch backfill)
+- **CLI historical data**: 244ms for 30 days of 1m data (excellent for backtesting)
+
+**Decision**: Keep Python httpx for live collection, use CLI for historical backfill.
+
+### Open Questions
+
+- [ ] What's the actual Polymarket rate limit? (Test with 250ms intervals)
+- [ ] Do we need all 4 samples/minute, or is 1m backfill sufficient?
+- [ ] Should backfill run continuously (e.g., every hour) or daily batch?
+- [ ] How to handle timezone alignment between live (UTC) and CLI data?
+
+---
+
+## PHASE 3.6 — L2 Order Book Data Collection
+
+### Analysis Summary (2026-02-24)
+
+**Discovery**: polymarket-cli `clob book` returns **full L2 order book** (20-100 price levels),
+but we're currently only storing **L1** (best bid/ask). See `../perf-tests/L2_DATA_COMPARISON.md`
+for comprehensive analysis.
+
+**What We're Missing**:
+- Multi-level depth (only have top-of-book)
+- Order book imbalance signals
+- Accurate slippage estimation for larger orders
+- Liquidity scoring and market microstructure
+- Spoofing/manipulation detection
+
+**Strategic Impact**: L2 data unlocks:
+- Slippage-aware order sizing
+- Liquidity-based entry timing
+- Order book imbalance prediction
+- Volume-weighted mid price (VWMP)
+- Price impact estimation
+
+### Implementation Options
+
+**Option 1: Store Full L2** (comprehensive, ~100 MB/day/10 tokens)  
+**Option 2: Store Aggregate Metrics** (lightweight, +10% storage)  
+**Option 3: Hybrid** (recommended) — aggregate metrics + periodic full snapshots
+
+### Schema Changes
+
+#### Add Aggregate L2 Metrics to `pm_snapshots` (Quick Win)
+
+```sql
+ALTER TABLE pm_snapshots ADD COLUMN IF NOT EXISTS
+    -- Depth metrics (cumulative $ at multiple levels)
+    bid_depth_5          DOUBLE,
+    ask_depth_5          DOUBLE,
+    bid_depth_10         DOUBLE,
+    ask_depth_10         DOUBLE,
+    
+    -- Order book imbalance
+    depth_imbalance_5    DOUBLE,  -- (bid_5 - ask_5) / (bid_5 + ask_5)
+    depth_imbalance_10   DOUBLE,
+    
+    -- Spread at depth
+    spread_pct_5         DOUBLE,  -- Spread between L5 bid and L5 ask
+    
+    -- Estimated slippage for market orders
+    slippage_100         DOUBLE,  -- $ slippage for $100 order
+    slippage_1000        DOUBLE,  -- $ slippage for $1000 order
+    
+    -- Book metadata
+    total_ask_levels     INTEGER,
+    total_bid_levels     INTEGER,
+    book_timestamp       BIGINT;  -- Unix timestamp from CLOB API
+```
+
+#### New Table: `pm_order_book_levels` (Full L2)
+
+For periodic full snapshots (every 5 minutes):
+
+```sql
+CREATE TABLE pm_order_book_levels (
+    ts                   TIMESTAMPTZ NOT NULL,
+    token_id             VARCHAR     NOT NULL,
+    side                 VARCHAR     NOT NULL,  -- 'BID' | 'ASK'
+    level                INTEGER     NOT NULL,  -- 1, 2, 3, ...
+    price                DOUBLE      NOT NULL,
+    size                 DOUBLE      NOT NULL,
+    cumulative_size      DOUBLE,                -- Running sum to this level
+    PRIMARY KEY (ts, token_id, side, level)
+);
+
+CREATE INDEX idx_ob_levels_token_ts ON pm_order_book_levels (token_id, ts);
+```
+
+#### View: `pm_book_metrics` (Pre-computed L2 Analytics)
+
+```sql
+CREATE VIEW pm_book_metrics AS
+SELECT
+    ts,
+    token_id,
+    (best_ask - best_bid) / best_bid AS spread_pct,
+    bid_depth_5 / ask_depth_5 AS depth_ratio_5,
+    depth_imbalance_10 AS market_pressure,
+    CASE
+        WHEN bid_depth_10 + ask_depth_10 > 5000 THEN 1.0
+        WHEN bid_depth_10 + ask_depth_10 > 1000 THEN 0.5
+        ELSE 0.2
+    END AS liquidity_score
+FROM pm_snapshots
+WHERE source = 'live';
+```
+
+### Collection Tasks
+
+- [ ] **Phase 1: Aggregate L2 Metrics** (1-2 days, lightweight)
+  - [ ] Update `db/schema.sql` with new `pm_snapshots` columns
+  - [ ] Implement L2 metrics computation in `pm_clob_consumer.py`:
+    - If WS provides L2 → compute from WS messages
+    - If WS provides L1 only → poll `polymarket clob book` every minute
+  - [ ] Add `compute_l2_metrics(order_book)` helper function:
+    ```python
+    def compute_l2_metrics(book, levels=[5, 10]):
+        """Compute aggregate L2 metrics from order book."""
+        metrics = {}
+        
+        for n in levels:
+            bid_depth = sum(float(b['size']) * float(b['price']) 
+                          for b in book['bids'][:n])
+            ask_depth = sum(float(a['size']) * float(a['price']) 
+                          for a in book['asks'][:n])
+            
+            metrics[f'bid_depth_{n}'] = bid_depth
+            metrics[f'ask_depth_{n}'] = ask_depth
+            metrics[f'depth_imbalance_{n}'] = (
+                (bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-9)
+            )
+        
+        # Estimate slippage for $100, $1000 market orders
+        metrics['slippage_100'] = estimate_slippage(book['asks'], 100)
+        metrics['slippage_1000'] = estimate_slippage(book['asks'], 1000)
+        
+        return metrics
+    ```
+  - [ ] Test with live WS feed or CLI polling (whichever is available)
+  - [ ] Backfill last 7 days with CLI book queries (script: `scripts/backfill_l2.py`)
+
+- [ ] **Phase 2: Full L2 Storage** (3-4 days, comprehensive)
+  - [ ] Create `pm_order_book_levels` table
+  - [ ] Implement L2 level-by-level collection:
+    - Store full book every 5 minutes (balance storage vs granularity)
+    - Or: store on significant book changes (>5% depth shift at L1-L5)
+  - [ ] Add partition by date: `PARTITION BY DATE_TRUNC('day', ts)`
+  - [ ] Monitor storage growth, set retention policy (e.g., 90 days)
+
+- [ ] **Phase 3: L2-Based Strategy Components** (1-2 weeks)
+  - [ ] `backtest/l2_signals.py` — Order book imbalance indicators
+  - [ ] `backtest/slippage.py` — Slippage estimation from L2
+  - [ ] `backtest/liquidity.py` — Liquidity scoring and filtering
+  - [ ] `backtest/vwmp.py` — Volume-weighted mid price calculation
+  - [ ] Integration with existing strategy framework
+
+### L2 Collection Strategy: Hybrid Approach (Recommended)
+
+1. **Real-time aggregate metrics**: Store in `pm_snapshots` every snapshot (250/500/750ms)
+   - Low overhead (~10% storage increase)
+   - Sufficient for most strategies (imbalance, liquidity, slippage)
+
+2. **Periodic full L2**: Store in `pm_order_book_levels` every 5 minutes
+   - Validation and detailed analysis
+   - Reconstruct book state for debugging
+   - ~100 MB/day for 10 active tokens
+
+3. **Historical price backfill**: Use CLI historical (no L2, but fills gaps)
+   - Run daily at 3:00 AM UTC
+   - Covers gaps from downtime/rate limits
+
+### Rate Limit Considerations
+
+- [ ] Test `polymarket clob book` polling rate
+  - Target: 1 query/minute per token (should be safe)
+  - Monitor 429 responses, implement exponential backoff
+  - If hit limits: reduce to 1 query/2 minutes or use WS if available
+
+- [ ] Alternative: Check if Polymarket WebSocket provides L2
+  - Inspect WS message format from `pm_clob_consumer.py`
+  - If WS has L2 → no polling needed (real-time L2 for free!)
+  - If WS has L1 only → hybrid: WS for L1 + CLI polling for L2 metrics
+
+### Storage Cost Estimates
+
+**Aggregate L2 only** (Phase 1):
+- +8 columns per snapshot
+- ~20% size increase per row
+- 4 snapshots/min × 60 min × 24 hr = 5,760 snapshots/day/token
+- For 10 tokens: ~57,600 rows/day
+- Size: ~5 MB/day (negligible)
+
+**Full L2** (Phase 2):
+- ~50 levels per snapshot (25 bids, 25 asks)
+- 1 full snapshot every 5 minutes = 288 snapshots/day/token
+- For 10 tokens: 288 × 50 × 10 = 144,000 rows/day
+- Size: ~100 MB/day
+
+**Total with hybrid**: ~105 MB/day (manageable)
+
+### New Strategies Unlocked
+
+1. **Slippage-Aware Sizing**
+   - Walk L2 book to calculate exact fill price
+   - Adjust order size to stay within slippage threshold
+   - Example: If $1000 order has >2% slippage, reduce to $500
+
+2. **Liquidity-Based Entry Timing**
+   - Only enter when spread < 1% AND depth > $1000 at L1-L5
+   - Avoids illiquid windows with high slippage
+
+3. **Order Book Imbalance Prediction**
+   - Predict short-term price movement from bid/ask depth ratio
+   - Entry signal: imbalance > 0.2 (more bids → bullish)
+
+4. **VWMP Pricing**
+   - Use volume-weighted mid price instead of simple mid
+   - More accurate for large orders
+
+5. **Spoofing Detection**
+   - Track large orders that appear/cancel without filling
+   - Avoid entering when book is manipulated
+
+### Open Questions
+
+- [ ] Does Polymarket WS provide L2 data? (Check `pm_clob_consumer.py` message format)
+- [ ] What's the CLI book query rate limit? (Test with 1 query/min)
+- [ ] Should we store top 5, 10, or full book levels?
+- [ ] Is 5-minute full L2 snapshot frequency sufficient?
+- [ ] Should we backfill historical L2? (Not possible via CLI, only going forward)
+
+### References
+
+- Full analysis: `../perf-tests/L2_DATA_COMPARISON.md`
+- CLI book command: `polymarket -o json clob book {token_id}`
+- Example L2 response: 64 ask levels, 21 bid levels (see comparison doc)
+
+---
+
 ## PHASE 4 — Backtesting Framework
 
 ### 4a — Data Loader
